@@ -1,13 +1,14 @@
 # TCP Rate Limiting — Manual Testing Guide
 
-> **Important:** These tests operate at the **TCP connection layer**, not HTTP.
-> We use `openssl s_client` to open and **hold** TCP/TLS connections, and monitor
-> Envoy's `downstream_cx_active` stat to see the connection count in real-time.
+> **Important:** Testing TCP limits (unlike HTTP limits) requires opening raw TCP/TLS connections and **holding them open** to build up concurrent connections.
+> We use a simple Python script to do this cleanly without flooding your terminal.
 
-## Environment Setup
+## 1. Environment Setup
+
+First, set up your variables in Terminal 1 (keep this terminal open for the tests):
 
 ```bash
-# ── Set variables (run once) ──
+# ── Set variables ──
 export LB_IP=23.111.176.42
 export HOST=rl4.incubera.xyz
 export ENVOY_NS=envoy-gateway-system
@@ -17,384 +18,208 @@ export ENVOY_POD=$(kubectl get pods -n $ENVOY_NS \
 gateway.envoyproxy.io/owning-gateway-namespace=$TENANT_NS \
   -o jsonpath='{.items[0].metadata.name}')
 echo "Envoy pod: $ENVOY_POD"
-
-# ── Port-forward Envoy admin (keep running in a separate terminal) ──
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000
 ```
 
-> **Tip:** Keep 3 terminals open:
-> - **Terminal 1** — Run load commands
-> - **Terminal 2** — `watch` Envoy stats
-> - **Terminal 3** — Try new connections (`curl`)
+## 2. Create the TCP Load Tool
+
+Instead of spamming `openssl` in the background (which causes terminal issues), run this block to create a clean `tcp-load.py` loading tool:
+
+```bash
+cat << 'EOF' > tcp-load.py
+#!/usr/bin/env python3
+import socket, ssl, time, threading, sys, argparse
+
+parser = argparse.ArgumentParser(description="TCP Load Tester")
+parser.add_argument("-c", "--connections", type=int, default=100, help="Concurrent connections")
+parser.add_argument("-duration", type=int, default=30, help="Hold duration (seconds)")
+parser.add_argument("-host", default="rl4.incubera.xyz", help="SNI Hostname")
+parser.add_argument("ip", help="Target IP:Port")
+args = parser.parse_args()
+
+ip, port = args.ip.split(":"); port = int(port)
+print(f"Opening {args.connections} connections to {ip}:{port} (SNI: {args.host})...")
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False; ctx.verify_mode = ssl.CERT_NONE
+sockets, connected, failed, lock = [], 0, 0, threading.Lock()
+
+def worker():
+    global connected, failed
+    try:
+        s = socket.create_connection((ip, port), timeout=5)
+        tls = ctx.wrap_socket(s, server_hostname=args.host)
+        with lock: sockets.append(tls); connected += 1
+    except:
+        with lock: failed += 1
+
+threads = [threading.Thread(target=worker) for _ in range(args.connections)]
+for t in threads: t.start()
+for t in threads: t.join()
+
+print(f"Successfully opened {connected} active connections. ({failed} failed)")
+print(f"Holding connections open for {args.duration} seconds...")
+try: time.sleep(args.duration)
+except KeyboardInterrupt: pass
+print("Closing connections.")
+for s in sockets: s.close()
+EOF
+chmod +x tcp-load.py
+```
+
+## 3. Enable Envoy Stats Monitoring
+
+Open a **separate terminal (Terminal 2)**, set the `ENVOY_POD` variable again, and run port-forwarding so we can observe Envoy's metrics:
+
+```bash
+# In Terminal 2 (keep this running)
+export ENVOY_POD=$(kubectl get pods -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest,gateway.envoyproxy.io/owning-gateway-namespace=vishanti-ratelimit4 -o jsonpath='{.items[0].metadata.name}')
+kubectl port-forward -n envoy-gateway-system $ENVOY_POD 19000:19000
+```
+
+> **Tip:** Open a **third terminal (Terminal 3)** to check stats while the load is running!
 
 ---
 
 ## Test 1: Global Max Connections (1000/pod)
 
-**What:** Overload Manager limits total active TCP connections per Envoy pod.
-**Config:** `envoy-gateway-tenant.yaml` → `max_active_downstream_connections: 1000`
-**Effective limit:** ~2000 (1000 × 2 pods)
+**What:** Targets Overload Manager `max_active_downstream_connections: 1000`
 
-### Baseline
-
+### Baseline (Terminal 3)
 ```bash
-# Terminal 2: Watch active connection count on this pod
-watch -n1 "curl -s localhost:19000/stats | grep listener.0.0.0.0_10443.downstream_cx_active"
-
-# Terminal 3: Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+curl -s localhost:19000/stats | grep "listener.0.0.0.0_10443.downstream_cx_active" | grep -v worker
 ```
+Expected: `0` (or very low)
 
-**Expected:** `downstream_cx_active: 0` (or very low), HTTP 200.
-
-### During Load
-
+### During Load (Terminal 1)
 ```bash
-# Terminal 1: Open 3000 TCP/TLS connections and hold them open
-for j in $(seq 1 3000); do
-  openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
-  sleep 0.01
-done
-
-# Terminal 2: Watch the active connection count climb
-# It should plateau around 1000 on this pod (other 1000 go to pod 2)
-watch -n1 "curl -s localhost:19000/stats | grep listener.0.0.0.0_10443.downstream_cx_active"
-
-# Terminal 3: Try a NEW connection once limit is reached
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 5
+# Open 1200 connections and hold them for 20 seconds
+./tcp-load.py -c 1200 -duration 20 23.111.176.42:443
 ```
+Expected output: Notice some connections fail because the limit is hit.
 
-**Expected:**
-- `downstream_cx_active` climbs to ~1000, then new connections are refused
-- `curl` in Terminal 3 gets **connection refused/timeout** or **HTTP 503**
-- Overload stats show `stop_accepting_connections` triggered
-
-### After Load
-
+### Verify Limits Hit (Terminal 3 - Run while the python script above is running)
 ```bash
-# Terminal 1: Kill all background openssl connections
-pkill -f "openssl s_client"
+# Check active connections -- it should plateau around 1000
+curl -s localhost:19000/stats | grep "listener.0.0.0.0_10443.downstream_cx_active" | grep -v worker
 
-# Terminal 2: Watch connection count drop back to 0
-# Terminal 3: Verify recovery
-sleep 5
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+# Check Overload Manager intervention
+curl -s localhost:19000/stats | grep "overload.envoy.overload_actions.stop_accepting_connections.active"
 
-# Check overload manager stats
-curl -s localhost:19000/stats | grep "overload.stop_accepting"
+# Try another connection
+curl -sk https://rl4.incubera.xyz/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 3
 ```
-
-**Expected:** Connections drop to 0, HTTP 200 restored.
+Expected: `stop_accepting_connections` reads `1` (active), meaning the load shedding triggered.
 
 ---
 
-## Test 2: Connection Rate Limiting (50 conn/sec per pod)
+## Test 2: Connection Rate Limiting (50 conn/sec)
 
-**What:** `local_ratelimit` listener filter uses a token bucket to throttle new TCP connections.
-**Config:** `tcp-rate-limits.yaml` → token bucket (50 tokens, 50/s refill)
-**Effective limit:** ~100 new conn/s (50 × 2 pods)
-
-### Baseline
+**What:** Targets the `local_ratelimit` Listener Filter.
 
 ```bash
-# Terminal 2: Watch the rate limit stats
-watch -n1 "curl -s localhost:19000/stats | grep local_ratelimit"
-
-# Terminal 3: Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+# In Terminal 1 (Blast 200 connections instantly, hold for 5s)
+./tcp-load.py -c 200 -duration 5 23.111.176.42:443
 ```
-
-**Expected:** HTTP 200, `local_ratelimit` counters at baseline.
-
-### During Load
 
 ```bash
-# Terminal 1: Open 200 connections as fast as possible (no sleep = burst)
-for j in $(seq 1 200); do
-  openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
-done
-
-# Terminal 2: Watch rate_limited counter increase
-watch -n1 "curl -s localhost:19000/stats | grep local_ratelimit"
-
-# Terminal 3: Try a connection during the burst
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 3
+# In Terminal 3 (Run immediately after the blast)
+# Check for rate_limited stats indicating connections were rejected
+curl -s localhost:19000/stats | grep "local_ratelimit.rate_limited"
 ```
-
-**Expected:**
-- Many connections get **refused** (rate exceeded 50/s per pod)
-- `local_ratelimit.rate_limited` counter increases
-- `curl` in Terminal 3 may return **429** or connection refused
-
-### After Load
-
-```bash
-# Terminal 1: Kill all background openssl
-pkill -f "openssl s_client"
-
-# Wait for token bucket to refill (1 second)
-sleep 2
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
-
-# Check how many were rate-limited
-curl -s localhost:19000/stats | grep local_ratelimit
-```
-
-**Expected:** HTTP 200. Token bucket refills instantly. `rate_limited` counter shows total rejections.
+Expected: You will see connections failing in the python script output, and the `rate_limited` counter in Envoy stats will increase.
 
 ---
 
-## Test 3: Per-Listener Connection Limit (500/chain/pod)
+## Test 3: Per-Listener Connection Limit (500/chain)
 
-**What:** `connection_limit` network filter caps active connections per filter chain.
-**Config:** `tcp-rate-limits.yaml` → `max_connections: 500`
-**Effective limit:** ~1000 (500 × 2 pods)
-
-### Baseline
+**What:** Targets the `connection_limit` Network Filter.
 
 ```bash
-# Terminal 2: Watch connection limit stats
-watch -n1 "curl -s localhost:19000/stats | grep connection_limit"
-
-# Terminal 3: Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+# In Terminal 1 (Open 600 connections to the HTTPS port)
+./tcp-load.py -c 600 -duration 15 23.111.176.42:443
 ```
-
-**Expected:** HTTP 200, `connection_limit.limited_connections: 0`.
-
-### During Load
 
 ```bash
-# Terminal 1: Open 600 connections and hold them (exceeds 500/pod)
-for j in $(seq 1 600); do
-  openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
-  sleep 0.01
-done
+# In Terminal 3 (Run while load is active)
+# Check active connections
+curl -s localhost:19000/stats | grep "downstream_cx_active" | grep -v worker
 
-# Terminal 2: Watch limited_connections counter
-watch -n1 "curl -s localhost:19000/stats | grep connection_limit"
-
-# Terminal 3: Try a new connection once at limit
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 5
+# Check limited_connections counter
+curl -s localhost:19000/stats | grep "connection_limit.https-10443.limited_connections"
 ```
-
-**Expected:**
-- `active_connections` climbs to 500, then stops
-- `limited_connections` counter increases (excess connections rejected)
-- `curl` may fail with connection reset/refused
-
-### After Load
-
-```bash
-# Terminal 1: Clean up
-pkill -f "openssl s_client"
-sleep 3
-
-# Terminal 3: Verify recovery
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
-curl -s localhost:19000/stats | grep connection_limit
-```
-
-**Expected:** HTTP 200. `limited_connections` shows total rejections during the test.
+Expected: The Envoy counter `limited_connections` will increase as it rejects connections over 500 on this specific listener.
 
 ---
 
 ## Test 4: Per-IP Connection Rate (via RLS)
 
-**What:** `ratelimit` network filter checks per-IP rates against external Rate Limit Service (Redis).
-**Config:** `tcp-rate-limits.yaml` → domain `tcp_ratelimit4`, descriptor `remote_address`
-**Depends on:** RLS ConfigMap having `tcp_ratelimit4` domain
+> **⚠️ CRITICAL WARNING (SNAT):** If your LoadBalancer uses `externalTrafficPolicy: Cluster`, the Kubernetes kube-proxy will perform Source NAT (SNAT). This means Envoy will rate-limit the **internal IP of your Kubernetes worker nodes**, not the actual end-user's public IP! Keep this in mind for production.
 
-### Baseline
+**What:** Targets the `ratelimit` network filter checking against Redis RLS.
 
 ```bash
-# Terminal 2: Watch RLS-related stats
-watch -n1 "curl -s localhost:19000/stats | grep tcp_conn_rate_per_ip"
-
-# Verify RLS config has the TCP domain
-kubectl get configmap -n $ENVOY_NS -l app=ratelimit -o yaml | grep -A5 "tcp_ratelimit4"
-
-# Terminal 3: Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+# In Terminal 1 (Blast 50 connections from a single IP limit)
+./tcp-load.py -c 50 -duration 5 23.111.176.42:443
 ```
-
-**Expected:** HTTP 200. If `tcp_ratelimit4` domain is not in RLS config, this filter passes all connections.
-
-### During Load
 
 ```bash
-# Terminal 1: Open 50 rapid connections from this single IP
-for j in $(seq 1 50); do
-  openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
-done
-
-# Terminal 2: Watch for over_limit or cx_closed stats
-watch -n1 "curl -s localhost:19000/stats | grep tcp_conn_rate_per_ip"
-
-# Terminal 3: Try another connection
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 3
+# In Terminal 3 (Run immediately after)
+# Check global rate limit stats
+curl -s localhost:19000/stats | grep "ratelimit" | grep -v local
 ```
-
-**Expected (if RLS configured):**
-- Some connections get **closed/refused** (per-IP rate exceeded)
-- `over_limit` counter increases
-- `curl` returns 429 or connection refused
-
-**Expected (if RLS NOT configured):**
-- All connections succeed — filter is installed but no matching domain in RLS.
-
-### After Load
-
-```bash
-pkill -f "openssl s_client"
-sleep 2
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
-curl -s localhost:19000/stats | grep tcp_conn_rate_per_ip
-```
+Expected: If your RLS ConfigMap is loaded with the IP limits, the `over_limit` counter will increase.
 
 ---
 
 ## Test 5: TCP Keepalive / Half-Open Detection
 
-**What:** `ClientTrafficPolicy` enables TCP keepalive probes on connections.
-**Config:** `tcp-connection-limits.yaml` → probes=3, idleTime=60s, interval=10s
-**Detection:** Dead connections closed within ~90s of going idle.
+**What:** Verifies `ClientTrafficPolicy` `tcpKeepalive` probes close truly dead connections in ~90s.
 
-### Baseline (verify config)
+> **Note:** A connection that is simply idle will not be closed if the client OS is healthy (it will reply to keepalive probes with ACKs). To test keepalive, we must simulate a "dead" client by forcibly dropping traffic.
 
 ```bash
-# Verify the CTP has keepalive configured
-kubectl get clienttrafficpolicy ratelimit4-tcp-limits -n $TENANT_NS \
-  -o jsonpath='{.spec.tcpKeepalive}' && echo
+# In Terminal 1 (Open a single connection)
+./tcp-load.py -c 1 -duration 120 23.111.176.42:443 &
 
-# Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+# Immediately drop all incoming packets from the LB to simulate a severed connection
+sudo iptables -A INPUT -s 23.111.176.42 -j DROP
 ```
-
-**Expected:** `{"idleTime":"60s","interval":"10s","probes":3}`
-
-### During Load (idle connection test)
 
 ```bash
-# Terminal 1: Open a single connection and leave it completely idle
-openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
-OPENSSL_PID=$!
-echo "Connection PID: $OPENSSL_PID"
-
-# Terminal 2: Watch the connection in Envoy stats
-watch -n1 "curl -s localhost:19000/stats | grep listener.0.0.0.0_10443.downstream_cx_active"
-
-# Wait 15 seconds (less than idleTime=60s)
-sleep 15
-
-# Check if connection is still alive
-kill -0 $OPENSSL_PID 2>/dev/null && echo "ALIVE after 15s (expected)" || echo "DEAD (unexpected)"
-
-# For full keepalive test, wait ~100 seconds total:
-# sleep 100
-# kill -0 $OPENSSL_PID 2>/dev/null && echo "STILL ALIVE (unexpected)" || echo "CLOSED by keepalive (expected)"
+# In Terminal 3 (Monitor it occasionally)
+curl -s localhost:19000/stats | grep "listener.0.0.0.0_10443.downstream_cx_active" | grep -v worker
 ```
-
-**Expected:**
-- Connection stays **alive** after 15s (keepalive probes start at 60s)
-- After ~90s of complete idleness, the connection would be closed by Envoy
-
-### After Load
+Expected: The connection will show as `active_cx: 1` initially. After exactly 90s, Envoy's keepalive probes will realize the client is dead (because iptables dropped the ACKs) and forcefully close it, returning Envoy stats to `0`.
 
 ```bash
-kill $OPENSSL_PID 2>/dev/null
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+# IMPORTANT: Remove the firewall rule when done! (Terminal 1)
+sudo iptables -D INPUT -s 23.111.176.42 -j DROP
 ```
-
-**Expected:** HTTP 200.
 
 ---
 
-## Test 6: SYN Flood Protection (Kernel)
+## Test 6: SYN Flood Protection (Linux Kernel)
 
-**What:** Linux kernel's TCP SYN cookies prevent SYN flood attacks from exhausting the connection table.
-**Config:** `/etc/sysctl.conf` → `tcp_syncookies=1`, `tcp_max_syn_backlog=1024`
-**Level:** Kernel — protects TCP handshake before Envoy even sees the connection.
-
-### Baseline
+**What:** Tests kernel `sysctl` (`tcp_syncookies`) protection against SYN floods. Note: This test operates beneath Envoy.
 
 ```bash
-# Verify sysctl settings
+# In Terminal 1 (Verify settings)
 sysctl net.ipv4.tcp_syncookies
 sysctl net.ipv4.tcp_max_syn_backlog
-
-# Check kernel log for existing SYN flood messages
 dmesg | grep -i "SYN flood" | tail -3
-
-# Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 ```
 
-**Expected:** `tcp_syncookies = 1`, `tcp_max_syn_backlog = 1024`, HTTP 200.
-
-### During Load (SYN flood)
-
 ```bash
-# Terminal 1: Launch a SYN flood (spoofed source IPs, max speed)
-sudo hping3 -S -p 443 --flood --rand-source $LB_IP &
+# In Terminal 1 (Launch a raw packet SYN flood)
+sudo hping3 -S -p 443 --flood --rand-source 23.111.176.42 &
 FLOOD_PID=$!
-
-# Wait 5 seconds for the flood to build up
 sleep 5
 
-# Terminal 3: Try LEGITIMATE connections during the flood
-for i in 1 2 3 4 5; do
-  curl -sk https://$HOST/ -o /dev/null -w "Attempt $i: HTTP %{http_code} in %{time_total}s\n" --connect-timeout 5
-  sleep 1
-done
+# In Terminal 3 (Try a legitimate connection)
+curl -sk https://rl4.incubera.xyz/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 5
 
-# Check if kernel detected the flood
-dmesg | grep -i "SYN flood" | tail -5
-```
-
-**Expected:**
-- Legitimate connections return **HTTP 200** despite the flood
-- Kernel may log: `TCP: Possible SYN flooding on port 443. Sending cookies.`
-- SYN cookies let real clients complete the handshake
-
-### After Load
-
-```bash
-# Stop the flood
+# Clean up (Terminal 1)
 kill $FLOOD_PID 2>/dev/null
-
-# Verify full recovery
-sleep 2
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
-
-# Final kernel log check
-dmesg | grep -i "SYN flood" | tail -5
+dmesg | grep -i "SYN flood" | tail -3
 ```
-
-**Expected:** HTTP 200, normal latency. Server fully recovered.
-
----
-
-## Cleanup (after all tests)
-
-```bash
-# Kill any remaining background openssl connections
-pkill -f "openssl s_client" 2>/dev/null
-
-# Kill any port-forwards
-pkill -f "kubectl port-forward" 2>/dev/null
-
-# Verify everything is clean
-curl -sk https://$HOST/ -o /dev/null -w "Final check: HTTP %{http_code}\n"
-```
-
-## Quick Reference
-
-| # | Feature | Load Tool | Monitor Stat | Success Indicator |
-|---|---------|-----------|-------------|-------------------|
-| 1 | Global Max Conn | `openssl s_client` ×3000 | `downstream_cx_active` | Plateaus at ~1000/pod |
-| 2 | Conn Rate | `openssl` burst (no sleep) | `local_ratelimit.rate_limited` | Counter increases |
-| 3 | Listener Limit | `openssl s_client` ×600 | `connection_limit.limited_connections` | Counter increases |
-| 4 | Per-IP Rate | `openssl` ×50 rapid | `tcp_conn_rate_per_ip.over_limit` | Connections refused |
-| 5 | TCP Keepalive | Single idle `openssl` | `downstream_cx_active` | Drops after ~90s |
-| 6 | SYN Flood | `hping3 --flood` | `dmesg` kernel log | `curl` still returns 200 |
+Expected: `curl` returns `HTTP 200` perfectly during the attack because `tcp_syncookies` handles the flood. The `dmesg` output will show `Possible SYN flooding on port 443. Sending cookies.`
