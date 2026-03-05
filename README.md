@@ -1,22 +1,13 @@
 # TCP Rate Limiting — Manual Testing Guide
 
-**Environment:**
+> **Important:** These tests operate at the **TCP connection layer**, not HTTP.
+> We use `openssl s_client` to open and **hold** TCP/TLS connections, and monitor
+> Envoy's `downstream_cx_active` stat to see the connection count in real-time.
 
-| Item | Value |
-|------|-------|
-| Namespace | `vishanti-ratelimit4` |
-| Gateway | `albpolicytest` |
-| Domain | `rl4.incubera.xyz` |
-| LB IP | `23.111.176.42` |
-| Envoy Replicas | 2 |
+## Environment Setup
 
-**Prerequisites:**
 ```bash
-# Tools needed
-apt-get install -y hping3     # For SYN flood test
-go install github.com/rakyll/hey@latest  # Or use pre-installed hey
-
-# Set variables used throughout
+# ── Set variables (run once) ──
 export LB_IP=23.111.176.42
 export HOST=rl4.incubera.xyz
 export ENVOY_NS=envoy-gateway-system
@@ -25,429 +16,385 @@ export ENVOY_POD=$(kubectl get pods -n $ENVOY_NS \
   -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest,\
 gateway.envoyproxy.io/owning-gateway-namespace=$TENANT_NS \
   -o jsonpath='{.items[0].metadata.name}')
-echo "Using Envoy pod: $ENVOY_POD"
+echo "Envoy pod: $ENVOY_POD"
+
+# ── Port-forward Envoy admin (keep running in a separate terminal) ──
+kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000
 ```
+
+> **Tip:** Keep 3 terminals open:
+> - **Terminal 1** — Run load commands
+> - **Terminal 2** — `watch` Envoy stats
+> - **Terminal 3** — Try new connections (`curl`)
 
 ---
 
-## Test 1: Global Max Connections
+## Test 1: Global Max Connections (1000/pod)
 
-**What:** Overload Manager limits total active TCP connections per Envoy pod to **1000**.  
-**Config:** `envoy-gateway-tenant.yaml` → `global_downstream_max_connections: 1000`  
+**What:** Overload Manager limits total active TCP connections per Envoy pod.
+**Config:** `envoy-gateway-tenant.yaml` → `max_active_downstream_connections: 1000`
 **Effective limit:** ~2000 (1000 × 2 pods)
 
-### Baseline (before load)
+### Baseline
 
 ```bash
-# 1. Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
+# Terminal 2: Watch active connection count on this pod
+watch -n1 "curl -s localhost:19000/stats | grep listener.0.0.0.0_10443.downstream_cx_active"
 
-# 2. Check current active connections on each pod
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "downstream_cx_active" | grep -v worker | head -5
-kill $PF_PID 2>/dev/null
+# Terminal 3: Verify connectivity
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 ```
 
-**Expected:** HTTP 200, very few active connections.
+**Expected:** `downstream_cx_active: 0` (or very low), HTTP 200.
 
 ### During Load
 
 ```bash
-# 3. Open 1200 concurrent connections and hold them (limit is 1000/pod, 2000 effective)
-hey -c 1200 -z 30s -q 1 -host "$HOST" https://$LB_IP/
+# Terminal 1: Open 3000 TCP/TLS connections and hold them open
+for j in $(seq 1 3000); do
+  openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
+  sleep 0.01
+done
 
-# 4. While hey is running, in another terminal check active connections:
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "downstream_cx_active" | grep -v worker
-curl -s http://localhost:19000/stats | grep "overload.stop_accepting"
-kill $PF_PID 2>/dev/null
+# Terminal 2: Watch the active connection count climb
+# It should plateau around 1000 on this pod (other 1000 go to pod 2)
+watch -n1 "curl -s localhost:19000/stats | grep listener.0.0.0.0_10443.downstream_cx_active"
 
-# 5. Try a new connection while at capacity:
+# Terminal 3: Try a NEW connection once limit is reached
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 5
+```
+
+**Expected:**
+- `downstream_cx_active` climbs to ~1000, then new connections are refused
+- `curl` in Terminal 3 gets **connection refused/timeout** or **HTTP 503**
+- Overload stats show `stop_accepting_connections` triggered
+
+### After Load
+
+```bash
+# Terminal 1: Kill all background openssl connections
+pkill -f "openssl s_client"
+
+# Terminal 2: Watch connection count drop back to 0
+# Terminal 3: Verify recovery
+sleep 5
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+
+# Check overload manager stats
+curl -s localhost:19000/stats | grep "overload.stop_accepting"
+```
+
+**Expected:** Connections drop to 0, HTTP 200 restored.
+
+---
+
+## Test 2: Connection Rate Limiting (50 conn/sec per pod)
+
+**What:** `local_ratelimit` listener filter uses a token bucket to throttle new TCP connections.
+**Config:** `tcp-rate-limits.yaml` → token bucket (50 tokens, 50/s refill)
+**Effective limit:** ~100 new conn/s (50 × 2 pods)
+
+### Baseline
+
+```bash
+# Terminal 2: Watch the rate limit stats
+watch -n1 "curl -s localhost:19000/stats | grep local_ratelimit"
+
+# Terminal 3: Verify connectivity
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+```
+
+**Expected:** HTTP 200, `local_ratelimit` counters at baseline.
+
+### During Load
+
+```bash
+# Terminal 1: Open 200 connections as fast as possible (no sleep = burst)
+for j in $(seq 1 200); do
+  openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
+done
+
+# Terminal 2: Watch rate_limited counter increase
+watch -n1 "curl -s localhost:19000/stats | grep local_ratelimit"
+
+# Terminal 3: Try a connection during the burst
 curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 3
 ```
 
 **Expected:**
-- `hey` output shows some failed connections if >2000 attempted
-- `downstream_cx_active` near 1000 per pod
-- New `curl` may get refused or timeout once limit is hit
+- Many connections get **refused** (rate exceeded 50/s per pod)
+- `local_ratelimit.rate_limited` counter increases
+- `curl` in Terminal 3 may return **429** or connection refused
 
 ### After Load
 
 ```bash
-# 6. Wait for hey to finish, then re-check
-sleep 5
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
+# Terminal 1: Kill all background openssl
+pkill -f "openssl s_client"
 
-# 7. Check overload stats
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "overload"
-kill $PF_PID 2>/dev/null
-```
-
-**Expected:** HTTP 200 restored, overload counters may show non-zero values.
-
----
-
-## Test 2: Connection Rate Limiting (Global)
-
-**What:** `local_ratelimit` listener filter limits new TCP connections to **50/sec per pod**.  
-**Config:** `tcp-rate-limits.yaml` → token bucket (50 tokens, refill 50/s)  
-**Effective limit:** ~100 conn/s (50 × 2 pods)
-
-### Baseline (before load)
-
-```bash
-# 1. Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
-
-# 2. Check current rate limit stats
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "local_ratelimit"
-kill $PF_PID 2>/dev/null
-```
-
-**Expected:** HTTP 200, rate limit counters at baseline values.
-
-### During Load
-
-```bash
-# 3. Burst 500 requests with 200 concurrent connections (far exceeds 50/s rate)
-hey -c 200 -n 500 -host "$HOST" https://$LB_IP/
-
-# 4. Look at hey output for:
-#    - Status code distribution (expect mix of 200 and 429)
-#    - Requests/sec achieved
-```
-
-**Expected:**
-- Many `429 Too Many Requests` responses
-- Actual throughput throttled to ~100 req/s (50/pod × 2)
-- Some `200 OK` responses (the ones that got through)
-
-### After Load
-
-```bash
-# 5. Wait 2 seconds (token bucket refills), then test again
+# Wait for token bucket to refill (1 second)
 sleep 2
 curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 
-# 6. Check rate limit counters increased
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "local_ratelimit"
-kill $PF_PID 2>/dev/null
+# Check how many were rate-limited
+curl -s localhost:19000/stats | grep local_ratelimit
 ```
 
-**Expected:** HTTP 200 restored. Rate limit `rate_limited` counter shows total rejections.
+**Expected:** HTTP 200. Token bucket refills instantly. `rate_limited` counter shows total rejections.
 
 ---
 
-## Test 3: Per-Listener Connection Limit
+## Test 3: Per-Listener Connection Limit (500/chain/pod)
 
-**What:** `connection_limit` network filter limits active connections to **500 per filter chain per pod**.  
-**Config:** `tcp-rate-limits.yaml` → `max_connections: 500`  
+**What:** `connection_limit` network filter caps active connections per filter chain.
+**Config:** `tcp-rate-limits.yaml` → `max_connections: 500`
 **Effective limit:** ~1000 (500 × 2 pods)
 
-### Baseline (before load)
+### Baseline
 
 ```bash
-# 1. Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
+# Terminal 2: Watch connection limit stats
+watch -n1 "curl -s localhost:19000/stats | grep connection_limit"
 
-# 2. Check connection limit stats
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "connection_limit"
-kill $PF_PID 2>/dev/null
+# Terminal 3: Verify connectivity
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 ```
 
-**Expected:** HTTP 200, `connection_limit.limited_connections: 0` or similar.
+**Expected:** HTTP 200, `connection_limit.limited_connections: 0`.
 
 ### During Load
 
 ```bash
-# 3. Open 600 concurrent long-lived connections (exceeds 500/pod on at least one)
-hey -c 600 -z 30s -q 1 -host "$HOST" https://$LB_IP/
+# Terminal 1: Open 600 connections and hold them (exceeds 500/pod)
+for j in $(seq 1 600); do
+  openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
+  sleep 0.01
+done
 
-# 4. While running, check another terminal:
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "connection_limit"
-kill $PF_PID 2>/dev/null
+# Terminal 2: Watch limited_connections counter
+watch -n1 "curl -s localhost:19000/stats | grep connection_limit"
+
+# Terminal 3: Try a new connection once at limit
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 5
 ```
 
 **Expected:**
-- `connection_limit.limited_connections` counter > 0
-- Some connections in `hey` output get connection errors
+- `active_connections` climbs to 500, then stops
+- `limited_connections` counter increases (excess connections rejected)
+- `curl` may fail with connection reset/refused
 
 ### After Load
 
 ```bash
-# 5. After hey finishes
+# Terminal 1: Clean up
+pkill -f "openssl s_client"
 sleep 3
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 
-# 6. Final stats check
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "connection_limit"
-kill $PF_PID 2>/dev/null
+# Terminal 3: Verify recovery
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
+curl -s localhost:19000/stats | grep connection_limit
 ```
 
-**Expected:** HTTP 200 restored. `limited_connections` counter shows how many were rejected.
+**Expected:** HTTP 200. `limited_connections` shows total rejections during the test.
 
 ---
 
 ## Test 4: Per-IP Connection Rate (via RLS)
 
-**What:** `ratelimit` network filter sends `remote_address` descriptor to external Rate Limit Service.  
-**Config:** `tcp-rate-limits.yaml` → domain `tcp_ratelimit4`  
-**Depends on:** RLS ConfigMap having `tcp_ratelimit4` domain configured
+**What:** `ratelimit` network filter checks per-IP rates against external Rate Limit Service (Redis).
+**Config:** `tcp-rate-limits.yaml` → domain `tcp_ratelimit4`, descriptor `remote_address`
+**Depends on:** RLS ConfigMap having `tcp_ratelimit4` domain
 
-### Baseline (before load)
+### Baseline
 
 ```bash
-# 1. Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
+# Terminal 2: Watch RLS-related stats
+watch -n1 "curl -s localhost:19000/stats | grep tcp_conn_rate_per_ip"
 
-# 2. Check if RLS is reachable and has the domain configured
-kubectl get configmap -n $ENVOY_NS -l app=ratelimit -o yaml | grep -A5 "tcp_ratelimit4" || \
-  echo "WARNING: tcp_ratelimit4 domain not found in RLS config"
+# Verify RLS config has the TCP domain
+kubectl get configmap -n $ENVOY_NS -l app=ratelimit -o yaml | grep -A5 "tcp_ratelimit4"
 
-# 3. Check ratelimit stats
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "ratelimit" | grep -v "local_ratelimit"
-kill $PF_PID 2>/dev/null
+# Terminal 3: Verify connectivity
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 ```
 
-**Expected:** HTTP 200. If RLS domain is not configured, all connections pass through.
+**Expected:** HTTP 200. If `tcp_ratelimit4` domain is not in RLS config, this filter passes all connections.
 
 ### During Load
 
 ```bash
-# 4. Send 100 rapid requests from this IP
-hey -c 50 -n 100 -host "$HOST" https://$LB_IP/
+# Terminal 1: Open 50 rapid connections from this single IP
+for j in $(seq 1 50); do
+  openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
+done
 
-# 5. Check status code distribution in hey output
+# Terminal 2: Watch for over_limit or cx_closed stats
+watch -n1 "curl -s localhost:19000/stats | grep tcp_conn_rate_per_ip"
+
+# Terminal 3: Try another connection
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 3
 ```
 
 **Expected (if RLS configured):**
-- Mix of `200` and `429` responses
-- `429` count increases as per-IP rate is exceeded
+- Some connections get **closed/refused** (per-IP rate exceeded)
+- `over_limit` counter increases
+- `curl` returns 429 or connection refused
 
 **Expected (if RLS NOT configured):**
-- All `200` — the filter is present but RLS has no matching domain/descriptors
+- All connections succeed — filter is installed but no matching domain in RLS.
 
 ### After Load
 
 ```bash
-# 6. Verify recovery
+pkill -f "openssl s_client"
 sleep 2
 curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
-
-# 7. Check ratelimit stats for this filter
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
-PF_PID=$!
-sleep 1
-curl -s http://localhost:19000/stats | grep "tcp_conn_rate_per_ip"
-kill $PF_PID 2>/dev/null
+curl -s localhost:19000/stats | grep tcp_conn_rate_per_ip
 ```
-
-**Expected:** HTTP 200. Stats show `cx_closed` or `over_limit` if RLS rejected connections.
-
-> **Note:** To enable per-IP TCP rate limiting, add this to your RLS ConfigMap:
-> ```yaml
-> domain: tcp_ratelimit4
-> descriptors:
->   - key: remote_address
->     rate_limit:
->       unit: second
->       requests_per_unit: 10
-> ```
 
 ---
 
 ## Test 5: TCP Keepalive / Half-Open Detection
 
-**What:** `ClientTrafficPolicy` configures TCP keepalive to detect and close dead/half-open connections.  
-**Config:** `tcp-connection-limits.yaml` → `probes: 3, idleTime: 60s, interval: 10s`  
-**Detection time:** ~90s for a dead connection (60s idle + 3×10s probes)
+**What:** `ClientTrafficPolicy` enables TCP keepalive probes on connections.
+**Config:** `tcp-connection-limits.yaml` → probes=3, idleTime=60s, interval=10s
+**Detection:** Dead connections closed within ~90s of going idle.
 
-### Baseline (verify configuration)
+### Baseline (verify config)
 
 ```bash
-# 1. Verify CTP is applied with keepalive settings
+# Verify the CTP has keepalive configured
 kubectl get clienttrafficpolicy ratelimit4-tcp-limits -n $TENANT_NS \
   -o jsonpath='{.spec.tcpKeepalive}' && echo
 
-# 2. Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
+# Verify connectivity
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 ```
 
-**Expected:**
-```json
-{"idleTime":"60s","interval":"10s","probes":3}
-```
+**Expected:** `{"idleTime":"60s","interval":"10s","probes":3}`
 
 ### During Load (idle connection test)
 
 ```bash
-# 3. Open a connection using openssl and leave it idle
+# Terminal 1: Open a single connection and leave it completely idle
 openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
 OPENSSL_PID=$!
+echo "Connection PID: $OPENSSL_PID"
 
-# 4. Wait 15 seconds (less than idleTime=60s)
+# Terminal 2: Watch the connection in Envoy stats
+watch -n1 "curl -s localhost:19000/stats | grep listener.0.0.0.0_10443.downstream_cx_active"
+
+# Wait 15 seconds (less than idleTime=60s)
 sleep 15
 
-# 5. Check if the connection is still alive
-kill -0 $OPENSSL_PID 2>/dev/null && echo "Connection ALIVE (expected)" || echo "Connection DEAD"
+# Check if connection is still alive
+kill -0 $OPENSSL_PID 2>/dev/null && echo "ALIVE after 15s (expected)" || echo "DEAD (unexpected)"
 
-# 6. Clean up
-kill $OPENSSL_PID 2>/dev/null
+# For full keepalive test, wait ~100 seconds total:
+# sleep 100
+# kill -0 $OPENSSL_PID 2>/dev/null && echo "STILL ALIVE (unexpected)" || echo "CLOSED by keepalive (expected)"
 ```
 
-**Expected:** Connection stays alive (keepalive probes only start after 60s idle).
+**Expected:**
+- Connection stays **alive** after 15s (keepalive probes start at 60s)
+- After ~90s of complete idleness, the connection would be closed by Envoy
 
 ### After Load
 
 ```bash
-# 7. Verify normal connectivity
+kill $OPENSSL_PID 2>/dev/null
 curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 ```
 
-**Expected:** HTTP 200. Keepalive is passive — it only activates on truly idle connections after 60s.
-
-> **Full keepalive test (optional, takes ~2 minutes):**
-> ```bash
-> # Open connection, then block the network (simulating a dead client)
-> openssl s_client -connect $LB_IP:443 -servername $HOST -quiet &
-> OPENSSL_PID=$!
-> # After 90s, Envoy should close the connection
-> sleep 100
-> kill -0 $OPENSSL_PID 2>/dev/null && echo "STILL ALIVE (unexpected)" || echo "CLOSED (expected)"
-> ```
+**Expected:** HTTP 200.
 
 ---
 
 ## Test 6: SYN Flood Protection (Kernel)
 
-**What:** Linux kernel's `tcp_syncookies` and `tcp_max_syn_backlog` protect against SYN flood attacks.  
-**Config:** `/etc/sysctl.conf` → `tcp_syncookies=1`, `tcp_max_syn_backlog=1024`  
-**Level:** Kernel (below Envoy — protects the TCP handshake itself)
+**What:** Linux kernel's TCP SYN cookies prevent SYN flood attacks from exhausting the connection table.
+**Config:** `/etc/sysctl.conf` → `tcp_syncookies=1`, `tcp_max_syn_backlog=1024`
+**Level:** Kernel — protects TCP handshake before Envoy even sees the connection.
 
-### Baseline (verify sysctl settings)
+### Baseline
 
 ```bash
-# 1. Check current kernel settings
+# Verify sysctl settings
 sysctl net.ipv4.tcp_syncookies
 sysctl net.ipv4.tcp_max_syn_backlog
 
-# 2. Check for any existing SYN flood messages in kernel log
+# Check kernel log for existing SYN flood messages
 dmesg | grep -i "SYN flood" | tail -3
 
-# 3. Verify connectivity
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
+# Verify connectivity
+curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code}\n"
 ```
 
-**Expected:**
-```
-net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_max_syn_backlog = 1024
-```
+**Expected:** `tcp_syncookies = 1`, `tcp_max_syn_backlog = 1024`, HTTP 200.
 
 ### During Load (SYN flood)
 
 ```bash
-# 4. Start a SYN flood in the background (needs root)
-#    --flood = max speed, --rand-source = spoofed source IPs, -S = SYN packets
+# Terminal 1: Launch a SYN flood (spoofed source IPs, max speed)
 sudo hping3 -S -p 443 --flood --rand-source $LB_IP &
 FLOOD_PID=$!
 
-# 5. Wait 5 seconds for the flood to build up
+# Wait 5 seconds for the flood to build up
 sleep 5
 
-# 6. Try a LEGITIMATE connection while the flood is active
-curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n" --connect-timeout 5
-
-# 7. Try multiple times to confirm consistency
+# Terminal 3: Try LEGITIMATE connections during the flood
 for i in 1 2 3 4 5; do
-  curl -sk https://$HOST/ -o /dev/null -w "Attempt $i: HTTP %{http_code} in %{time_total}s\n" --connect-timeout 3
-  sleep 0.5
+  curl -sk https://$HOST/ -o /dev/null -w "Attempt $i: HTTP %{http_code} in %{time_total}s\n" --connect-timeout 5
+  sleep 1
 done
 
-# 8. Check kernel log for SYN flood detection
+# Check if kernel detected the flood
 dmesg | grep -i "SYN flood" | tail -5
 ```
 
 **Expected:**
-- Legitimate `curl` requests return **HTTP 200** despite the flood  
+- Legitimate connections return **HTTP 200** despite the flood
 - Kernel may log: `TCP: Possible SYN flooding on port 443. Sending cookies.`
+- SYN cookies let real clients complete the handshake
 
-### After Load (stop flood and verify)
+### After Load
 
 ```bash
-# 9. Stop the flood
+# Stop the flood
 kill $FLOOD_PID 2>/dev/null
-wait $FLOOD_PID 2>/dev/null
 
-# 10. Verify the server is fully responsive
+# Verify full recovery
 sleep 2
 curl -sk https://$HOST/ -o /dev/null -w "HTTP %{http_code} in %{time_total}s\n"
 
-# 11. Final kernel log check
+# Final kernel log check
 dmesg | grep -i "SYN flood" | tail -5
 ```
 
-**Expected:** HTTP 200 with normal latency. Server fully recovered.
+**Expected:** HTTP 200, normal latency. Server fully recovered.
 
 ---
 
-## Quick Reference: All Tests at a Glance
-
-| # | Feature | Mechanism | Limit | Test Tool | Key Indicator |
-|---|---------|-----------|-------|-----------|---------------|
-| 1 | Global Max Conn | Overload Manager | 1000/pod | `hey -c 1200` | Connections refused |
-| 2 | Conn Rate (Global) | `local_ratelimit` filter | 50/s/pod | `hey -c 200 -n 500` | HTTP 429 responses |
-| 3 | Per-Listener Limit | `connection_limit` filter | 500/chain/pod | `hey -c 600` | Connection errors |
-| 4 | Per-IP Rate (RLS) | `ratelimit` + Redis | configurable | `hey -c 50 -n 100` | HTTP 429 responses |
-| 5 | TCP Keepalive | ClientTrafficPolicy | 60s idle | `openssl s_client` | Conn dies after ~90s |
-| 6 | SYN Flood | Kernel sysctl | 1024 backlog | `hping3 --flood` | Legit conn still works |
-
-## Useful Envoy Stats Commands
+## Cleanup (after all tests)
 
 ```bash
-# Port-forward to Envoy admin (run once, use in subsequent commands)
-kubectl port-forward -n $ENVOY_NS $ENVOY_POD 19000:19000 &
+# Kill any remaining background openssl connections
+pkill -f "openssl s_client" 2>/dev/null
 
-# All connection-related stats
-curl -s localhost:19000/stats | grep -E "downstream_cx_(active|total)" | grep -v worker
+# Kill any port-forwards
+pkill -f "kubectl port-forward" 2>/dev/null
 
-# Rate limit counters
-curl -s localhost:19000/stats | grep "local_ratelimit"
-
-# Connection limit filter stats
-curl -s localhost:19000/stats | grep "connection_limit"
-
-# Per-IP RLS stats
-curl -s localhost:19000/stats | grep "tcp_conn_rate_per_ip"
-
-# Overload manager stats
-curl -s localhost:19000/stats | grep "overload"
-
-# Kill port-forward when done
-kill %1 2>/dev/null
+# Verify everything is clean
+curl -sk https://$HOST/ -o /dev/null -w "Final check: HTTP %{http_code}\n"
 ```
+
+## Quick Reference
+
+| # | Feature | Load Tool | Monitor Stat | Success Indicator |
+|---|---------|-----------|-------------|-------------------|
+| 1 | Global Max Conn | `openssl s_client` ×3000 | `downstream_cx_active` | Plateaus at ~1000/pod |
+| 2 | Conn Rate | `openssl` burst (no sleep) | `local_ratelimit.rate_limited` | Counter increases |
+| 3 | Listener Limit | `openssl s_client` ×600 | `connection_limit.limited_connections` | Counter increases |
+| 4 | Per-IP Rate | `openssl` ×50 rapid | `tcp_conn_rate_per_ip.over_limit` | Connections refused |
+| 5 | TCP Keepalive | Single idle `openssl` | `downstream_cx_active` | Drops after ~90s |
+| 6 | SYN Flood | `hping3 --flood` | `dmesg` kernel log | `curl` still returns 200 |
