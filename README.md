@@ -87,7 +87,7 @@ kubectl port-forward -n envoy-gateway-system $ENVOY_POD 19000:19000
 
 ### Baseline (Terminal 3)
 ```bash
-curl -s localhost:19000/stats | grep "listener.0.0.0.0_10443.downstream_cx_active" | grep -v worker
+watch -n1 "curl -s localhost:19000/stats | grep "listener.0.0.0.0_10443.downstream_cx_active" | grep -v worker"
 ```
 Expected: `0` (or very low)
 
@@ -102,10 +102,11 @@ Expected output: Notice some connections fail because the 200 combined connectio
 ### Verify Limits Hit (Terminal 3 - Run while the python script above is running)
 ```bash
 # Check active connections -- it should plateau EXACTLY at 100 (or 200, depending on load balancer pod affinity)
-curl -s localhost:19000/stats | grep "listener.0.0.0.0_10443.downstream_cx_active" | grep -v worker
+watch -n1 "curl -s localhost:19000/stats | grep "listener.0.0.0.0_10443.downstream_cx_active" | grep -v worker"
 
 # Try another connection
 curl -sk https://rl4.incubera.xyz/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 3
+watch -n1 "curl https://rl4.incubera.xyz"
 ```
 Expected: The `downstream_cx_active` gauge will abruptly stop at `100` and refuse to go any higher. The `curl` command will hang or fail (Unexpected EOF) because the global capacity has been reached and Envoy is aggressively slamming the door on any new TCP requests.
 
