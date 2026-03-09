@@ -12,7 +12,7 @@ First, set up your variables in Terminal 1 (keep this terminal open for the test
 export LB_IP=23.111.176.42
 export HOST=rl4.incubera.xyz
 export ENVOY_NS=envoy-gateway-system
-export TENANT_NS=vishanti-ratelimit4
+export TENANT_NS=vishanti-tcprl
 export ENVOY_POD=$(kubectl get pods -n $ENVOY_NS \
   -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest,\
 gateway.envoyproxy.io/owning-gateway-namespace=$TENANT_NS \
@@ -72,7 +72,7 @@ Open a **separate terminal (Terminal 2)**, set the `ENVOY_POD` variable again, a
 
 ```bash
 # In Terminal 2 (keep this running)
-export ENVOY_POD=$(kubectl get pods -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest,gateway.envoyproxy.io/owning-gateway-namespace=vishanti-ratelimit4 -o jsonpath='{.items[0].metadata.name}')
+export ENVOY_POD=$(kubectl get pods -n envoy-gateway-system -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest,gateway.envoyproxy.io/owning-gateway-namespace=$TENANT_NS -o jsonpath='{.items[0].metadata.name}')
 kubectl port-forward -n envoy-gateway-system $ENVOY_POD 19000:19000
 ```
 
@@ -80,9 +80,10 @@ kubectl port-forward -n envoy-gateway-system $ENVOY_POD 19000:19000
 
 ---
 
-## Test 1: Global Max Connections (1000/pod)
+## Test 1: Global Max Connections (100/pod)
 
-**What:** Targets Overload Manager `max_active_downstream_connections: 1000`
+**What:** Tests the absolute hard ceiling for the entire proxy pod. 
+**Target Config:** `max_active_downstream_connections: 100` in `envoy-gateway-tenant.yaml` (Overload Manager).
 
 ### Baseline (Terminal 3)
 ```bash
@@ -92,51 +93,53 @@ Expected: `0` (or very low)
 
 ### During Load (Terminal 1)
 ```bash
-# Open 1200 connections and hold them for 20 seconds
-./tcp-load.py -c 1200 -duration 20 23.111.176.42:443
+# Open 300 connections at 60 conns/sec (to stay under the 100 conns/sec global rate limit)
+# The test should finish in ~5 seconds and immediately hit the 200 combined connection limit!
+./tcp-load.py -c 300 -duration 10 -rate 60 23.111.176.42:443
 ```
-Expected output: Notice some connections fail because the limit is hit.
+Expected output: Notice some connections fail because the 200 combined connection limit is hit.
 
 ### Verify Limits Hit (Terminal 3 - Run while the python script above is running)
 ```bash
-# Check active connections -- it should plateau around 1000
+# Check active connections -- it should plateau EXACTLY at 100 (or 200, depending on load balancer pod affinity)
 curl -s localhost:19000/stats | grep "listener.0.0.0.0_10443.downstream_cx_active" | grep -v worker
-
-# Check Overload Manager intervention
-curl -s localhost:19000/stats | grep "overload.envoy.overload_actions.stop_accepting_connections.active"
 
 # Try another connection
 curl -sk https://rl4.incubera.xyz/ -o /dev/null -w "HTTP %{http_code}\n" --connect-timeout 3
 ```
-Expected: `stop_accepting_connections` reads `1` (active), meaning the load shedding triggered.
+Expected: The `downstream_cx_active` gauge will abruptly stop at `100` and refuse to go any higher. The `curl` command will hang or fail (Unexpected EOF) because the global capacity has been reached and Envoy is aggressively slamming the door on any new TCP requests.
 
 ---
 
-## Test 2: Connection Rate Limiting (50 conn/sec)
+## Test 2: Connection Rate (Global): 50 conn/sec per Envoy pod
+## Effective rate ≈ 100 conn/sec with 2 Envoy replicas
 
-**What:** Targets the `local_ratelimit` Listener Filter.
+**What:** Targets the `local_ratelimit` Network Filter.
 
 ```bash
 # In Terminal 1 (Blast 200 connections instantly, hold for 5s)
-./tcp-load.py -c 200 -duration 5 23.111.176.42:443
+./tcp-load.py -c 500 -duration 1 23.111.176.42:443
 ```
 
 ```bash
 # In Terminal 3 (Run immediately after the blast)
 # Check for rate_limited stats indicating connections were rejected
-curl -s localhost:19000/stats | grep "local_ratelimit.rate_limited"
+curl -s localhost:19000/stats | grep "local_rate_limit.tcp_conn_rate_global_https.rate_limited"
 ```
 Expected: You will see connections failing in the python script output, and the `rate_limited` counter in Envoy stats will increase.
 
 ---
 
-## Test 3: Per-Listener Connection Limit (500/chain)
+## Test 3: Per-Listener Connection Limit (50/chain per pod)
+## Effective limit ≈ 100 connections with 2 Envoy replicas
 
-**What:** Targets the `connection_limit` Network Filter.
+**What:** Tests the smaller "room capacity" limit applied only to a specific listener/port (HTTPS on 443).
+**Target Config:** `envoy.filters.network.connection_limit` set to `max_connections: 50` in `tcp-rate-limits.yaml`.
 
 ```bash
-# In Terminal 1 (Open 600 connections to the HTTPS port)
-./tcp-load.py -c 600 -duration 15 23.111.176.42:443
+# In Terminal 1 (Open 150 connections to the HTTPS port)
+# We throttle the connection initiation to 30 conns/sec to avoid hitting the 50 conns/sec rate limit!
+./tcp-load.py -c 150 -duration 10 -rate 30 23.111.176.42:443
 ```
 
 ```bash
