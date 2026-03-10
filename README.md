@@ -9,15 +9,14 @@ First, set up your variables in Terminal 1 (keep this terminal open for the test
 
 ```bash
 # ── Set variables ──
-export LB_IP=23.111.176.42
-export HOST=rl4.incubera.xyz
-export ENVOY_NS=envoy-gateway-system
-export TENANT_NS=vishanti-tcprl
-export ENVOY_POD=$(kubectl get pods -n $ENVOY_NS \
-  -l gateway.envoyproxy.io/owning-gateway-name=albpolicytest,\
-gateway.envoyproxy.io/owning-gateway-namespace=$TENANT_NS \
-  -o jsonpath='{.items[0].metadata.name}')
-echo "Envoy pod: $ENVOY_POD"
+export TENANT_NS="vishanti-tcpglobal3" && \
+export ENVOY_NS="envoy-gateway-system" && \
+export GATEWAY_NAME=$(kubectl get gateway -n $TENANT_NS -o jsonpath='{.items[0].metadata.name}') && \
+export LB_IP=$(kubectl get gateway $GATEWAY_NAME -n $TENANT_NS -o jsonpath='{.status.addresses[0].value}') && \
+export HOST=$(kubectl get httproute -n $TENANT_NS -o jsonpath='{.items[0].spec.hostnames[0]}') && \
+export ENVOY_POD=$(kubectl get pods -n $ENVOY_NS -l gateway.envoyproxy.io/owning-gateway-namespace=$TENANT_NS,gateway.envoyproxy.io/owning-gateway-name=$GATEWAY_NAME -o jsonpath='{.items[0].metadata.name}') && \
+echo -e "\n--- Test Variables Loaded ---\nTENANT_NS: $TENANT_NS\nGATEWAY: $GATEWAY_NAME\nLB_IP: $LB_IP\nHOST: $HOST\nENVOY_POD: $ENVOY_POD\n-----------------------------"
+
 ```
 
 ## 2. Create the TCP Load Tool
