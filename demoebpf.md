@@ -463,3 +463,274 @@ The easiest enhancement for your demo is a dedicated script:
 - print summary
 
 If you want, I can generate **one final `run-test-case.sh` script** that supports all 4 scenarios automatically.
+
+
+Below is a **presentation script / speaking script** you can use to explain `src/xdp_vishanti_combined.c` in a demo.
+
+---
+
+# Demo Explanation Script for `xdp_vishanti_combined.c`
+
+## 1. What this file is
+
+> This file contains the main eBPF program that runs at the **XDP hook** on the network interface `bond0`.  
+> XDP is the earliest place in the Linux packet path where we can inspect and drop packets.  
+> That means we can stop unwanted TCP traffic before it reaches Cilium, Envoy, or the application.
+
+---
+
+## 2. What this program does
+
+> This single XDP program performs two protections for each managed LoadBalancer IP:
+>
+> 1. **SYN rate limiting**  
+>    It controls how many new TCP connection attempts per second are allowed.
+>
+> 2. **Concurrent connection limiting**  
+>    It controls how many TCP connections can exist at the same time.
+>
+> So this file is effectively the core of our kernel-level TCP protection.
+
+---
+
+## 3. Why this is called “combined”
+
+> Originally, SYN rate limiting and connection counting were considered as separate hooks, but because of how Cilium attaches its own TC programs, we merged the important logic into one XDP program.
+>
+> So this file combines:
+> - SYN token bucket logic
+> - connection count logic
+> - client-side FIN/RST decrement logic
+
+---
+
+## 4. High-level flow
+
+You can say:
+
+> For every packet arriving on `bond0`, this program does the following:
+>
+> - Parse Ethernet
+> - Parse IPv4
+> - Parse TCP
+> - Check whether destination IP is one of our managed LB IPs
+> - If not, the packet is ignored and passed through
+> - If it is a managed LB IP:
+>   - for SYN packets, enforce rate limit and max connection limit
+>   - for FIN/RST packets from the client side, decrement the connection counter
+
+---
+
+## 5. Maps used by this program
+
+> This program uses several BPF maps.  
+> The maps are the configuration and state storage for the eBPF program.
+
+### Configuration maps
+- `syn_provider_cfg`
+  - provider-level hard ceiling for SYN/sec and burst
+- `syn_tenant_cfg`
+  - tenant-level requested SYN/sec and burst
+- `conn_provider_max`
+  - provider hard ceiling for max concurrent connections
+- `conn_tenant_max`
+  - tenant requested max concurrent connections
+- `managed_lb_ips`
+  - list of LB IPs that this program should enforce
+
+### Runtime state maps
+- `syn_rate_state`
+  - stores token bucket state for each LB IP
+- `conn_count`
+  - stores active connection count per LB IP
+
+### Observability maps
+- `syn_drop_count`
+  - how many SYNs were dropped due to rate limiting
+- `conn_drop_count`
+  - how many SYNs were dropped due to max connection limit
+
+---
+
+## 6. Two-tier logic
+
+> This program implements **two-tier policy enforcement**.
+>
+> The provider defines the maximum allowed value.  
+> The tenant can define a value within that limit.  
+> The program enforces the tenant value, but the tenant is never allowed to exceed the provider ceiling.
+>
+> In other words, effective enforcement is:
+>
+> ```text
+> effective = min(provider, tenant)
+> ```
+
+---
+
+## 7. SYN rate limiting logic
+
+> For new TCP connections, the program looks only at packets with:
+>
+> - `SYN = 1`
+> - `ACK = 0`
+>
+> These are the initial connection attempts.
+>
+> For each LB IP, the program maintains a **token bucket**:
+>
+> - tokens refill over time according to configured rate
+> - burst defines the maximum bucket size
+> - every new SYN consumes one token
+> - if no tokens are available, the SYN is dropped immediately
+
+### What this means in practice
+> If tenant limit is 500 SYN/sec with burst 600:
+> - normal traffic under 500/sec passes
+> - brief spikes up to 600 are tolerated
+> - sustained traffic above 500/sec starts getting dropped
+
+---
+
+## 8. Connection count limiting logic
+
+> In addition to rate limiting, the program also counts concurrent TCP connections.
+>
+> When a SYN arrives and passes the rate check:
+> - it atomically increments the connection counter
+> - then checks whether the counter is above the allowed max
+> - if above limit, it rolls back the increment and drops the packet
+
+### Important implementation detail
+> We use an **increment-first, rollback-if-over-limit** pattern.  
+> This avoids race conditions between CPUs.
+>
+> So even under high parallel traffic, the limit is enforced safely.
+
+---
+
+## 9. FIN/RST handling
+
+> When the client sends a TCP `FIN` or `RST`, the XDP program decrements the connection counter.
+>
+> That means client-side close is accounted for inside XDP.
+>
+> For server-side closes, we intended to use TC egress, but because of Cilium hook ordering, that path is limited, so we added a cleanup reconciliation mechanism in userspace.
+
+---
+
+## 10. Why XDP is important
+
+> XDP is important because it runs before the normal Linux network stack.
+>
+> So if a packet is over limit:
+> - it is dropped immediately
+> - it never reaches Envoy
+> - it never reaches the backend
+> - CPU and memory usage are protected
+
+### Short demo-friendly line
+> “We are dropping attack traffic in the kernel, not in userspace.”
+
+---
+
+## 11. Why this protects full TCP connections
+
+> Even though many of our tests use raw SYN packets, this is still valid for full TCP connections.
+>
+> A full TCP connection always begins with a SYN.  
+> If we drop that SYN, the full TCP handshake never completes.
+>
+> So from the perspective of rate limiting:
+> - blocking SYN = blocking the TCP connection establishment
+
+---
+
+## 12. What happens for a packet in this program
+
+You can say this step-by-step:
+
+> Example packet flow:
+>
+> 1. A SYN comes to LB IP `23.111.176.43`
+> 2. Program checks whether `23.111.176.43` is a managed LB
+> 3. It reads provider and tenant config from maps
+> 4. It checks token bucket:
+>    - if too many SYNs/sec → drop
+> 5. If rate is OK, it checks connection count:
+>    - if too many concurrent connections → drop
+> 6. If both checks pass:
+>    - connection is allowed
+>    - packet continues to Cilium and Envoy
+
+---
+
+## 13. Example from your demo
+
+You can give this concrete example:
+
+> Suppose for a tenant we configure:
+>
+> - provider ceiling:
+>   - 10000 SYN/sec
+>   - 30000 max connections
+>
+> - tenant limit:
+>   - 2000 SYN/sec
+>   - 7500 max connections
+>
+> Then this XDP program enforces:
+>
+> - 2000 SYN/sec effective limit
+> - 7500 concurrent connections effective limit
+>
+> If I send:
+> - 300/sec with total 800 → no drops
+> - 700/sec with total 800 → SYN drops occur
+> - 300/sec with total 2000 → connection drops occur when 7500 is exceeded in a real case, or 1000 if configured lower for demo
+
+---
+
+## 14. Why maps are important in the demo
+
+> The code itself stays the same.  
+> We do not recompile the program when changing tenant values.
+>
+> Instead, we update the BPF maps:
+> - provider map
+> - tenant map
+> - connection max map
+>
+> This means configuration changes are live, immediate, and do not require restarts.
+
+---
+
+## 15. One-line explanation of each code section
+
+If someone asks “what are the major parts of this file?” say:
+
+- **struct definitions** → describe config and runtime state
+- **map definitions** → persistent kernel storage
+- **refill_and_consume()** → token bucket refill and rate enforcement
+- **get_effective_max()** → selects correct connection limit
+- **main XDP handler** → parses packet and applies logic
+- **drop counters** → record enforcement events for monitoring
+
+---
+
+## 16. Final summary line for this file
+
+> `xdp_vishanti_combined.c` is the kernel-side enforcement engine of this project.  
+> It sits on the NIC, identifies traffic for managed LoadBalancer IPs, applies two-tier TCP admission control, and drops excess SYNs or excess connections before they reach Envoy.
+
+---
+
+# Short 30-second version
+
+If you need a very short explanation:
+
+> This file is our main XDP eBPF program. It runs on the NIC at the earliest possible point in the kernel. It enforces two protections per LoadBalancer IP: maximum new TCP connections per second and maximum concurrent TCP connections. It reads provider and tenant limits from BPF maps, applies the effective minimum, and drops packets immediately if limits are exceeded.
+
+---
+
+If you want, I can next give you the same style **explanation script for `tc_vishanti_egress.c`**.
