@@ -93,9 +93,47 @@ AegisSovereignAI eliminates this vulnerability by binding the ZKP circuit's publ
 
 ## 3. System Architecture and Proposed Framework
 
-As illustrated in Fig. 1, AegisSovereignAI operates as a three-layer framework bridging infrastructure security and AI governance through the principle of silicon-to-audit trust every AI inference is bound to a verified hardware platform and a compliant geographic location. The architecture is organized into a centralized Control Plane (responsible for identity and attestation authority), an API Gateway (responsible for policy enforcement), and a set of distributed Sovereign Edge Nodes (responsible for execution and proof generation). This separation of concerns enables the framework to scale across public clouds, private data centers, and unmanaged edge devices while maintaining a unified root of trust.
+As illustrated in Figure 1, AegisSovereignAI operates as a three-layer framework bridging infrastructure security and AI governance through the principle of silicon-to-audit trust every AI inference is bound to a verified hardware platform and a compliant geographic location. The architecture is organized into a centralized Control Plane (responsible for identity and attestation authority), an API Gateway (responsible for policy enforcement), and a set of distributed Sovereign Edge Nodes (responsible for execution and proof generation). This separation of concerns enables the framework to scale across public clouds, private data centers, and unmanaged edge devices while maintaining a unified root of trust.
 
-![Fig. 1: AegisSovereignAI Three-Layer Zero-Trust Security Pipeline showing interactions between the Sovereign Edge Node, the API Gateway, and the Control Plane.](../Zero-Trust%20Security%20Pipeline-2026-05-03-183223.png)
+```mermaid
+graph TB
+    subgraph Layer1 ["Layer 1: Sovereign Edge Node (Trusted Platform)"]
+        direction TB
+        Sensors["Hardware Sensors<br/>(GNSS / Mobile Modem)"]
+        Sidecar["Geolocation Sidecar<br/>(Plonky2 ZKP Prover)"]
+        KAgent["Keylime Agent<br/>(Measured Host Boot)"]
+        TPM["Physical TPM 2.0<br/>(Identity Key & PCRs)"]
+        
+        Sensors -->|Raw Coords| Sidecar
+        Sidecar -->|Sovereignty Receipt| KAgent
+        KAgent -->|Extend PCR 15| TPM
+    end
+
+    subgraph Layer2 ["Layer 2: API Gateway (Boundary Enforcement)"]
+        direction TB
+        Envoy["Envoy Proxy Gateway"]
+        WASM["WASM Policy Filter<br/>(Stateless Verifier)"]
+        Envoy === WASM
+    end
+
+    subgraph Layer3 ["Layer 3: Sovereign Control Plane (Identity & Trust)"]
+        direction TB
+        KVer["Keylime Verifier<br/>(Host Attestation)"]
+        SPIRE["SPIRE Server<br/>(SVID CA)"]
+        KVer <-->|Verify Host State| SPIRE
+    end
+
+    subgraph Cloud ["Sovereign Execution Environment"]
+        TEE["Confidential VM (TEE)<br/>(Inference & Prompt Governance)"]
+    end
+
+    KAgent -->|SovereignAttestation Quote| KVer
+    SPIRE -->|Issue Sovereign SVID with Claims| Layer1
+    Layer1 -->|mTLS Request with SVID & ZKP| Envoy
+    WASM -->|Extract & Verify ZKP Proof| WASM
+    Envoy -->|Forward Clean Traffic| TEE
+```
+*Figure 1: AegisSovereignAI Three-Layer Zero-Trust Security Pipeline showing interactions between the Sovereign Edge Node, the API Gateway, and the Control Plane.*
 
 At the core of the framework is the Sovereign Trust Loop, a cyclic process of continuous execution environment validation. Security is treated not as a point-in-time check but as a persistent state of verifiable certainty. The loop involves continuous hardware quote polling, short-lived identity issuance, and real-time governance policy enforcement at the API gateway [43]. The three architectural layers Infrastructure Security, Unified Identity, and AI Governance interact as follows: verified hardware state flows upward to condition identity issuance, and verified identity flows upward to condition governance decisions, forming a closed, non-repudiable chain.
 
@@ -115,9 +153,44 @@ Layer 3 closes the trust loop by providing cryptographic verification of AI appl
 
 The Batch & Purge model resolves the audit paradox the conflict between auditability and PII liability by accumulating interactions into a Merkle Tree and generating a ZKP proving that all interactions in the batch adhered to the stated governance policy [14]. Once the proof is anchored to the audit log, the raw prompts and any associated PII are permanently purged. The resulting Evidence Bundle a JSON/JWS artifact containing ZKP proofs, hardware quotes, and identity signatures provides regulators with mathematical certainty of compliance without requiring access to proprietary or sensitive underlying data.
 
-The Sovereign Trust Loop follows a deterministic seven-stage sequence: (1) the Edge Node boots securely, with the TPM measuring each bootloader and kernel stage; (2) the Keylime Agent sends a TPM quote to the Verifier, which validates it against the Golden Manifest; (3) upon successful attestation, the SPIRE Agent issues an SVID with embedded hardware and location claims; (4) the Geolocation Sidecar generates a ZKP Sovereignty Receipt proving the node resides within a compliant Green Zone; (5) the AI application initiates an mTLS request to the API Gateway, where the Envoy WASM filter validates the SVID and embedded ZKP; (6) the Gateway forwards the authorized request for inference within the TEE; and (7) the completed interaction is added to the Merkle batch, the governance ZKP is generated, raw data is purged, and the Evidence Bundle is exported to the auditor.
+The Sovereign Trust Loop follows a deterministic seven-stage sequence (Figure 2): (1) the Edge Node boots securely, with the TPM measuring each bootloader and kernel stage; (2) the Keylime Agent sends a TPM quote to the Verifier, which validates it against the Golden Manifest; (3) upon successful attestation, the SPIRE Agent issues an SVID with embedded hardware and location claims; (4) the Geolocation Sidecar generates a ZKP Sovereignty Receipt proving the node resides within a compliant Green Zone; (5) the AI application initiates an mTLS request to the API Gateway, where the Envoy WASM filter validates the SVID and embedded ZKP; (6) the Gateway forwards the authorized request for inference within the TEE; and (7) the completed interaction is added to the Merkle batch, the governance ZKP is generated, raw data is purged, and the Evidence Bundle is exported to the auditor.
 
-![Fig. 2: AegisSovereignAI Seven-stage Sovereign Trust Loop sequence diagram. Stages 1–3 establish hardware-rooted trust and workload identity. Stage 4 generates the privacy-preserving ZKP geolocation proof. Stage 5 enforces policy at the API boundary (valid chain: HTTP 200; tampered: HTTP 403). Stage 6 executes AI inference within the TEE. Stage 7 produces a cryptographic Evidence Bundle while permanently eliminating all raw interaction data.](<../mermaid-diagram (5).png>)
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User / Client
+    participant Edge as Sovereign Edge Node (TPM 2.0)
+    participant Sidecar as Geolocation Sidecar
+    participant KAgent as Keylime Agent
+    participant KVer as Keylime Verifier
+    participant SPIRE as SPIRE Server
+    participant Envoy as Envoy API Gateway
+    participant TEE as Confidential TEE
+
+    Note over Edge, KVer: 1-3. Hardware Boot & Remote Attestation
+    Edge->>KAgent: Measured Boot Hash (PCR 0-7, 10)
+    KAgent->>KVer: Send TPM Quote & Host State
+    KVer->>KVer: Verify Quote against Golden Manifest
+    
+    Note over Sidecar, KAgent: 4. Geolocation & ZKP Proof Generation
+    Sidecar->>Sidecar: Retrieve coordinate telemetry
+    Sidecar->>Sidecar: Generate Plonky2 Geofence ZKP Proof
+    Sidecar->>KAgent: Extend PCR 15 with location hash
+    
+    Note over KAgent, SPIRE: Workload Identity Issuance
+    KAgent->>SPIRE: Request Workload SVID (App Key Cert)
+    SPIRE->>KVer: Query host attestation status & location
+    SPIRE-->>KAgent: Issue SVID (embedded geolocation claims)
+    
+    Note over User, TEE: 5-7. Boundary Enforcement & AI Inference
+    User->>Envoy: Request AI Inference via mTLS
+    Envoy->>Envoy: WASM Filter extracts and verifies ZKP proof
+    Envoy->>TEE: Forward request (if valid) to TEE Inference
+    TEE->>TEE: Run Prompt Governance & AI Inference
+    TEE->>TEE: Merkle Tree aggregation (Batch & Purge)
+    TEE-->>User: Return Sovereign Result & Evidence Bundle
+```
+*Figure 2: AegisSovereignAI Seven-stage Sovereign Trust Loop sequence diagram. Stages 1–3 establish hardware-rooted trust and workload identity. Stage 4 generates the privacy-preserving ZKP geolocation proof. Stage 5 enforces policy at the API boundary (valid chain: HTTP 200; tampered: HTTP 403). Stage 6 executes AI inference within the TEE. Stage 7 produces a cryptographic Evidence Bundle while permanently eliminating all raw interaction data.*
 
 
 ## 4. Methodology
@@ -298,7 +371,38 @@ Table 5 and Figure 3 summarize the composite security scores and highlight the m
 | Audit Integrity | 20 | **20** | 10 | 10 | Raw log retention creates PII liability; no ZKP compliance proof |
 | **Total** | 100 | **100** | **35** | **65** | |
 
-![Figure 3: Composite Security Score Matrix Comparison between AegisSovereignAI and Standard ZTA.](../3c.png)
+```mermaid
+flowchart TD
+    subgraph Aegis ["AegisSovereignAI (Total: 100/100)"]
+        direction LR
+        A1["Hardware Root (30/30)"]
+        A2["Identity Binding (30/30)"]
+        A3["Geo-Certainty (20/20)"]
+        A4["Audit Integrity (20/20)"]
+        
+        style A1 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+        style A2 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+        style A3 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+        style A4 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+    end
+
+    subgraph Base ["Standard ZTA Baseline (Total: 35/100)"]
+        direction LR
+        B1["Hardware Root (5/30)"]
+        B2["Identity Binding (15/30)"]
+        B3["Geo-Certainty (5/20)"]
+        B4["Audit Integrity (10/20)"]
+        
+        style B1 fill:#d62728,stroke:#fff,stroke-width:2px,color:#fff
+        style B2 fill:#ff7f0e,stroke:#fff,stroke-width:2px,color:#fff
+        style B3 fill:#d62728,stroke:#fff,stroke-width:2px,color:#fff
+        style B4 fill:#ff7f0e,stroke:#fff,stroke-width:2px,color:#fff
+    end
+
+    style Aegis fill:#e2f0d9,stroke:#385723,stroke-width:3px
+    style Base fill:#fce4d6,stroke:#c65911,stroke-width:3px
+```
+*Figure 3: Composite Security Score Matrix Comparison between AegisSovereignAI and Standard ZTA.*
 
 ---
 
@@ -348,7 +452,38 @@ The most computationally intensive operation at the edge node is the generation 
 | WASM Filter Verification (Envoy Gateway) | 3 ms | 2.8 ms | 4.2 ms | 5.1 ms |
 | End-to-End Trust Establishment | 310 ms | 298 ms | 365 ms | 412 ms |
 
-![Figure 4: Trust Establishment Latency Benchmarks and Overhead (Baseline vs. AegisSovereignAI).](../3c1.png)
+```mermaid
+flowchart TD
+    subgraph Aegis ["AegisSovereignAI (Total: 100/100)"]
+        direction LR
+        A1["Hardware Root (30/30)"]
+        A2["Identity Binding (30/30)"]
+        A3["Geo-Certainty (20/20)"]
+        A4["Audit Integrity (20/20)"]
+        
+        style A1 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+        style A2 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+        style A3 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+        style A4 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+    end
+
+    subgraph Base ["Standard ZTA Baseline (Total: 35/100)"]
+        direction LR
+        B1["Hardware Root (5/30)"]
+        B2["Identity Binding (15/30)"]
+        B3["Geo-Certainty (5/20)"]
+        B4["Audit Integrity (10/20)"]
+        
+        style B1 fill:#d62728,stroke:#fff,stroke-width:2px,color:#fff
+        style B2 fill:#ff7f0e,stroke:#fff,stroke-width:2px,color:#fff
+        style B3 fill:#d62728,stroke:#fff,stroke-width:2px,color:#fff
+        style B4 fill:#ff7f0e,stroke:#fff,stroke-width:2px,color:#fff
+    end
+
+    style Aegis fill:#e2f0d9,stroke:#385723,stroke-width:3px
+    style Base fill:#fce4d6,stroke:#c65911,stroke-width:3px
+```
+*Figure 3: Composite Security Score Matrix Comparison between AegisSovereignAI and Standard ZTA.*
 
 To establish a clear performance context, Figure 4 compares the latency of SVID issuance and geofencing verification under AegisSovereignAI against standard baselines. Standard SPIRE SVID issuance (without TPM attestation or Keylime validation) requires a mean of 38 ms. Fusing it with hardware-rooted attestation adds approximately 82 ms of cryptographic and network synchronization overhead (including TPM quote generation, registrar verification, and custom claims injection), resulting in a total of 120 ms. For geofencing, standard IP-based checks take a mean of 2 ms at the API gateway via local lookup. In contrast, AegisSovereignAI utilizes a client-side ZKP proof generation step taking 70 ms (asynchronously executed by the Geolocation Sidecar) and a gateway verification step taking 3 ms. Because proof generation is offloaded asynchronously, the actual impact on the request-path transaction latency is only the 3 ms verification overhead, which represents a negligible increase over the 2 ms baseline check.
 
@@ -384,9 +519,28 @@ The Geolocation Sidecar successfully generated verifiable proofs of Reg-K compli
 | Model Integrity (OCC SR 11-7) [10] | Static perimeter defenses; software checksums | TPM 2.0 Quote + IMA Attestation: proves untampered hardware/software execution state |
 | Data Governance (EU AI Act) [3] | Manual sampling of retained raw prompt logs | Batch & Purge Merkle ZKP: proves prompt compliance while enabling immediate PII deletion |
 
-![Figure 2: PII Retention Risk Surface (Retained Data in GB) comparing Traditional Logging against AegisSovereignAI over a 30-day evaluation period.](../3b.png)
+```mermaid
+flowchart TD
+    subgraph Baseline ["Traditional Logging Model"]
+        direction TB
+        B1["Prompt Storage: O(N) Growth<br/>(Linear with transaction volume)"]
+        B2["Accumulates raw prompt + response logs"]
+        B3["1 Million Transactions = 180 GB Data"]
+        B4["GDPR Data-Retention & Leak Liability"]
+        style B3 fill:#d62728,stroke:#fff,stroke-width:2px,color:#fff
+    end
+    subgraph Aegis ["AegisSovereignAI Batch & Purge"]
+        direction TB
+        A1["Storage: O(1) Constant Footprint<br/>(ZKP evidence bundle anchors only)"]
+        A2["Purges raw data immediately after verification"]
+        A3["1 Million Transactions = 0.1 GB Data"]
+        A4["Zero persistent PII storage & GDPR liability"]
+        style A3 fill:#2ca02c,stroke:#fff,stroke-width:2px,color:#fff
+    end
+```
+*Figure 5: PII Retention Risk Surface (Retained Data in GB) comparing Traditional Logging against AegisSovereignAI over a 30-day evaluation period.*
 
-To evaluate storage-related compliance and privacy risks, Figure 2 compares the PII retention risk surface under traditional logging against AegisSovereignAI over a 30-day evaluation window. Traditional logging systems retain raw prompt and response logs for compliance auditing, which grows linearly as $O(n)$ with transaction volume. Assuming a standard workload of 1 million transactions with an average raw log record size of 180 KB (including system prompts, contextual fragments, and LLM responses), traditional logging accumulates approximately 180 GB of sensitive, high-liability data. AegisSovereignAI's Batch & Purge model collapses this storage complexity to a constant $O(1)$ footprint per audit window. By purging all raw prompts and responses immediately after verifying policy compliance, the system retains only the cryptographic proofs and Merkle roots (~1.4 KB per batch verification proof). Over the same 1 million transaction volume, this reduces the persistent data footprint to approximately 0.1 GB representing a 99.9% relative reduction in the PII retention risk surface and eliminating GDPR data-retention liabilities.
+To evaluate storage-related compliance and privacy risks, Figure 5 compares the PII retention risk surface under traditional logging against AegisSovereignAI over a 30-day evaluation window. Traditional logging systems retain raw prompt and response logs for compliance auditing, which grows linearly as $O(n)$ with transaction volume. Assuming a standard workload of 1 million transactions with an average raw log record size of 180 KB (including system prompts, contextual fragments, and LLM responses), traditional logging accumulates approximately 180 GB of sensitive, high-liability data. AegisSovereignAI's Batch & Purge model collapses this storage complexity to a constant $O(1)$ footprint per audit window. By purging all raw prompts and responses immediately after verifying policy compliance, the system retains only the cryptographic proofs and Merkle roots (~1.4 KB per batch verification proof). Over the same 1 million transaction volume, this reduces the persistent data footprint to approximately 0.1 GB representing a 99.9% relative reduction in the PII retention risk surface and eliminating GDPR data-retention liabilities.
 
 ### 6.4 Comparative Analysis
 
@@ -414,8 +568,42 @@ The "Silicon Lottery" problem where identical AI models produce divergent output
 
 The Batch & Purge methodology fundamentally alters the cost structure of regulatory compliance for AI systems [8]. Traditional log-based compliance follows an O(n) model: every interaction is logged, stored, and periodically reviewed by human auditors. This approach incurs three compounding costs: (i) storage costs that scale linearly with interaction volume; (ii) privacy liability that grows with each stored PII instance; and (iii) audit labor costs proportional to log volume [8]. For a Tier-1 financial institution processing millions of AI advisory interactions daily, the cumulative cost of storing, securing, and auditing raw prompt logs represents a substantial and growing financial burden.
 
-Fig. 4 illustrates both the ZKP circuit construction and the Batch & Purge governance flow. AegisSovereignAI's Batch & Purge model collapses this to an O(1) structure: regardless of interaction volume, the compliance output per batch window is a fixed-size Evidence Bundle containing a Merkle root and a ZKP proof of approximately 1.4 KB [17]. The raw prompts are permanently purged, eliminating storage costs and privacy liability entirely. The auditor's verification task is reduced from reading thousands of log entries to running a mathematical verification function a computation that completes in approximately 3 ms [45]. This transforms regulatory auditing from a labor-intensive, retrospective process into an automated, real-time verification pipeline. The economic implications are significant: the marginal cost of compliance per additional AI interaction approaches zero, while the marginal privacy risk per additional interaction is exactly zero because no additional data is retained [8].
-![Fig. 4. Formal construction of the Plonky2 ZKP geofence circuit. Private witness inputs (latitude, longitude, sensor\_id) are never revealed to the verifier. Constraint C1 enforces geographic inclusion via range check and bit decomposition. Constraint C2 binds the proof to the specific TPM Attestation Key hash, preventing proof transplantation attacks across devices. (Right) Batch & Purge governance flow. Interactions accumulate within a TEE-protected Merkle tree; a single ZKP proves full-batch policy compliance before raw data is permanently purged, yielding O(1)-complexity audit verification with zero PII exposure](<../mermaid-diagram (4).jpg>)
+Figure 6 illustrates both the ZKP circuit construction and the Batch & Purge governance flow. AegisSovereignAI's Batch & Purge model collapses this to an O(1) structure: regardless of interaction volume, the compliance output per batch window is a fixed-size Evidence Bundle containing a Merkle root and a ZKP proof of approximately 1.4 KB [17]. The raw prompts are permanently purged, eliminating storage costs and privacy liability entirely. The auditor's verification task is reduced from reading thousands of log entries to running a mathematical verification function a computation that completes in approximately 3 ms [45]. This transforms regulatory auditing from a labor-intensive, retrospective process into an automated, real-time verification pipeline. The economic implications are significant: the marginal cost of compliance per additional AI interaction approaches zero, while the marginal privacy risk per additional interaction is exactly zero because no additional data is retained [8].
+
+```mermaid
+flowchart TB
+    subgraph Circuit ["Plonky2 Geofence Circuit"]
+        direction TB
+        subgraph PrivateWitness ["Private Witness Inputs"]
+            Lat["Latitude (x)"]
+            Lon["Longitude (y)"]
+            SID["Sensor ID"]
+        end
+        subgraph PublicInputs ["Public Instance Inputs"]
+            CLat["Center Lat (Cx)"]
+            CLon["Center Lon (Cy)"]
+            Rad["Radius (R)"]
+            IDHash["ID Hash"]
+        end
+        subgraph Constraints ["Circuit Constraints"]
+            C1["Constraint C1: Range Check<br/>(x - Cx)² + (y - Cy)² ≤ R²"]
+            C2["Constraint C2: Hardware Bind<br/>sensor_id == ID Hash"]
+        end
+        PrivateWitness ---> Constraints
+        PublicInputs ---> Constraints
+        Constraints ---> Proof["Generated ZKP Proof (π)"]
+    end
+
+    subgraph BatchPurge ["Batch & Purge Governance Flow"]
+        direction TB
+        Inputs["User Prompts / Responses"] ---> TEEBuffer["Buffered in TEE Memory"]
+        TEEBuffer ---> Accumulate["Accumulate into Merkle Tree"]
+        Accumulate ---> GenerateZKP["Generate Batch Compliance ZKP"]
+        GenerateZKP ---> Anchor["Anchor Proof to Audit Ledger"]
+        Anchor ---> Purge["🔥 Ephemeral Buffer Purged<br/>(Zero PII Retention)"]
+    end
+```
+*Figure 6: Formal construction of the Plonky2 ZKP geofence circuit and the Batch & Purge governance flow. Private witness inputs (latitude, longitude, sensor_id) are never revealed to the verifier. Constraint C1 enforces geographic inclusion via range check and bit decomposition. Constraint C2 binds the proof to the specific TPM Attestation Key hash, preventing proof transplantation attacks across devices. (Right) Batch & Purge governance flow. Interactions accumulate within a TEE-protected Merkle tree; a single ZKP proves full-batch policy compliance before raw data is permanently purged, yielding O(1)-complexity audit verification with zero PII exposure.*
 ---
 
 ## 7. Applications and Future Work
@@ -499,4 +687,3 @@ The reference implementation, including all source code, configuration files, te
 46. 	Open Policy Agent: Policy Language (Rego) Documentation, https://www.openpolicyagent.org/
 47. 	Hallman, R., Bryan, J., Xing, G., Boria, R.: Geofencing: A Survey of Architectures and Security Issues. IEEE Commun. Surv. Tutorials. 19, 1145–1171 (2017). https://doi.org/10.1109/COMST.2017.2686545
 48. 	Zhang, Y., Zheng, D., Chen, R.: vCNN: Verifiable Convolutional Neural Networks using ZK-SNARKs. (2020)
-
